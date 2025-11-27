@@ -22,7 +22,7 @@ process.env.FORCE_COLOR = '1';
  * @returns {string} Platform string (e.g., 'linux/amd64')
  */
 function getDockerPlatform() {
-	const arch = os.arch();
+	const arch = `x64`;
 	const dockerArch = {
 		x64: 'amd64',
 		arm64: 'arm64',
