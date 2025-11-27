@@ -121,13 +121,13 @@ else
 fi
 
 # Check if kubectl is configured
-if ! kubectl cluster-info &> /dev/null; then
-    echo "⚠️  kubectl is not configured to access a cluster"
+if ! kubectl get namespace ${K8S_NAMESPACE} &> /dev/null; then
+    echo "⚠️  kubectl is not configured or cannot access namespace '${K8S_NAMESPACE}'"
     
     if [ "$KANOPY_AVAILABLE" = true ]; then
         echo ""
         echo "Would you like to configure kubectl now using kanopy-oidc?"
-        read -p "Select environment - (s)taging or (p)roduction: " -n 1 -r
+        read -p "Select environment - (s)taging or (p)roduction or (n)o: " -n 1 -r
         echo ""
         
         if [[ $REPLY =~ ^[Ss]$ ]]; then
@@ -135,41 +135,78 @@ if ! kubectl cluster-info &> /dev/null; then
         elif [[ $REPLY =~ ^[Pp]$ ]]; then
             CLUSTER="prod"
         else
-            echo "Invalid selection. Skipping kubectl configuration."
+            echo "Skipping kubectl configuration."
+            read -p "Continue without kubectl? (y/N): " -n 1 -r
+            echo ""
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Aborted."
+                exit 1
+            fi
             KUBECTL_CONFIGURED=false
         fi
         
         if [ ! -z "$CLUSTER" ]; then
-            echo "Configuring kubectl for ${CLUSTER} environment..."
-            KOLD=$KUBECONFIG
-            export KUBECONFIG=~/.kube/config.$CLUSTER
-            mkdir -p $(dirname $KUBECONFIG)
+            echo ""
+            echo "=========================================="
+            echo "Configuring kubectl for ${CLUSTER}..."
+            echo "=========================================="
             
-            echo "Running kanopy-oidc kube setup..."
-            $KANOPY_OIDC_PATH kube setup $CLUSTER > $KUBECONFIG
+            KUBECONFIG_FILE=~/.kube/config.$CLUSTER
+            mkdir -p ~/.kube
             
-            echo "Running kanopy-oidc kube login..."
-            $KANOPY_OIDC_PATH kube login
-            
-            echo "Setting namespace to ${K8S_NAMESPACE}..."
-            kubectl config set-context $(kubectl config current-context) --namespace=${K8S_NAMESPACE}
-            
-            # Verify configuration worked
-            if kubectl cluster-info &> /dev/null; then
-                echo "✅ kubectl configured successfully for ${CLUSTER}"
-                KUBECTL_CONFIGURED=true
+            echo ""
+            echo "Step 1: Setting up kubeconfig..."
+            if $KANOPY_OIDC_PATH kube setup $CLUSTER > $KUBECONFIG_FILE; then
+                echo "✅ Kubeconfig file created at $KUBECONFIG_FILE"
             else
-                echo "❌ kubectl configuration failed"
-                export KUBECONFIG=$KOLD
+                echo "❌ Failed to setup kubeconfig"
                 KUBECTL_CONFIGURED=false
+            fi
+            
+            if [ "$KUBECTL_CONFIGURED" != "false" ]; then
+                echo ""
+                echo "Step 2: Authenticating with OIDC (browser will open)..."
+                echo "Please complete the login in your browser..."
+                
+                # Temporarily set KUBECONFIG for the login
+                KUBECONFIG=$KUBECONFIG_FILE $KANOPY_OIDC_PATH kube login
+                
+                if [ $? -eq 0 ]; then
+                    echo "✅ Authentication successful"
+                    
+                    echo ""
+                    echo "Step 3: Setting default namespace..."
+                    KUBECONFIG=$KUBECONFIG_FILE kubectl config set-context $(KUBECONFIG=$KUBECONFIG_FILE kubectl config current-context) --namespace=${K8S_NAMESPACE}
+                    
+                    echo ""
+                    echo "Step 4: Verifying connection..."
+                    if KUBECONFIG=$KUBECONFIG_FILE kubectl get namespace ${K8S_NAMESPACE} &> /dev/null; then
+                        echo "✅ kubectl configured successfully!"
+                        echo ""
+                        echo "To use kubectl in your terminal, run:"
+                        echo "  export KUBECONFIG=$KUBECONFIG_FILE"
+                        echo ""
+                        
+                        # Set for this script's execution
+                        export KUBECONFIG=$KUBECONFIG_FILE
+                        KUBECTL_CONFIGURED=true
+                    else
+                        echo "❌ Cannot access namespace '${K8S_NAMESPACE}'"
+                        KUBECTL_CONFIGURED=false
+                    fi
+                else
+                    echo "❌ Authentication failed"
+                    KUBECTL_CONFIGURED=false
+                fi
             fi
         fi
     else
         echo ""
-        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo "kanopy-oidc is not available."
+        read -p "Continue without kubectl? (y/N): " -n 1 -r
         echo ""
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "Aborted. Please install kanopy-oidc or configure kubectl manually"
+            echo "Aborted."
             exit 1
         fi
         KUBECTL_CONFIGURED=false
@@ -267,14 +304,39 @@ else
 fi
 echo ""
 
-# Step 4: Pull local image (if needed)
-echo "Step 4: Checking for local n8n image..."
+# Step 4: Pull and verify AMD64 image
+echo "Step 4: Preparing AMD64 image for Kubernetes cluster..."
+
+# Check if image exists locally
 if docker image inspect ${LOCAL_IMAGE} > /dev/null 2>&1; then
-    echo "✅ Local image '${LOCAL_IMAGE}' found"
+    echo "Local image '${LOCAL_IMAGE}' found"
+    
+    # Check architecture
+    LOCAL_ARCH=$(docker image inspect ${LOCAL_IMAGE} --format='{{.Architecture}}')
+    echo "Local image architecture: ${LOCAL_ARCH}"
+    
+    if [ "$LOCAL_ARCH" != "amd64" ]; then
+        echo ""
+        echo "⚠️  WARNING: Your local image is ${LOCAL_ARCH}, but Kubernetes needs AMD64!"
+        echo "This will cause 'exec format error' if deployed."
+        echo ""
+        read -p "Pull AMD64 version from Docker Hub? (Y/n): " -n 1 -r
+        echo ""
+        
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            echo "Pulling AMD64 version from Docker Hub..."
+            docker pull --platform linux/amd64 ${LOCAL_IMAGE}
+            echo "✅ AMD64 image pulled successfully"
+        else
+            echo "⚠️  Continuing with ${LOCAL_ARCH} image (this may not work in Kubernetes)"
+        fi
+    else
+        echo "✅ Image is already AMD64 - perfect for Kubernetes!"
+    fi
 else
-    echo "Local image not found. Pulling from Docker Hub..."
-    docker pull ${LOCAL_IMAGE}
-    echo "✅ Image pulled successfully"
+    echo "Local image not found. Pulling AMD64 version from Docker Hub..."
+    docker pull --platform linux/amd64 ${LOCAL_IMAGE}
+    echo "✅ AMD64 image pulled successfully"
 fi
 echo ""
 
